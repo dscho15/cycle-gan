@@ -1,0 +1,8 @@
+huggingface
+torch
+torchvision
+transformers
+Pillow
+ftfy
+regex
+tqdm
