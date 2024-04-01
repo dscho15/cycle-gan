@@ -1,0 +1,4 @@
+imgs/*
+checkpoints/*
+.vscode
+__pycache__/*
