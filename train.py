@@ -10,11 +10,18 @@ from torch.utils.data import DataLoader
 train_dataset = UnpairedDataset("train")
 test_dataset = UnpairedDataset("test")
 
+lambda_A = 10
+lambda_B = 10
+lambda_idt_A = 0.5
+lambda_idt_B = 0.5
+standard = False
+wasserstein = True
+
 # compute the logits
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 seed_env(42)
-batch_size = 2
+batch_size = 3
 train_loader = DataLoader(
     train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
 )
@@ -30,7 +37,7 @@ discriminator_B = Discriminator(64).cuda()
 
 gen_opt = torch.optim.AdamW(
     list(generator_A_to_B.parameters()) + list(generator_B_to_A.parameters()),
-    lr=2e-5,
+    lr=1e-5,
     betas=(0.5, 0.999),
 )
 disc_opt = torch.optim.AdamW(
@@ -45,7 +52,6 @@ n_epochs = 150
 
 gen_scaler = GradScaler()
 disc_scaler = GradScaler()
-
 
 def train_one_epoch(
     generator_A_to_B,
@@ -86,23 +92,73 @@ def train_one_epoch(
 
             h, w = discriminated_A_fake.shape[-2:]
 
-            loss_A = mse(discriminated_A_fake, torch.zeros(b, 1, h, w).cuda())
-            loss_A += mse(discriminated_A_real, torch.ones(b, 1, h, w).cuda())
-
             # domain B
             generated_B_fake = generator_A_to_B(A)
             discriminated_B_fake = discriminator_B(generated_B_fake.detach())
             discriminator_B_real = discriminator_B(B)
 
-            loss_B = mse(discriminated_B_fake, torch.zeros(b, 1, h, w).cuda())
-            loss_B += mse(discriminator_B_real, torch.ones(b, 1, h, w).cuda())
 
-            loss = (loss_A + loss_B) / 2.0
+            # ordinary GAN loss
+            if standard:
+                
+                loss_A = mse(discriminated_A_fake, torch.zeros(b, 1, h, w).cuda())
+                loss_A += mse(discriminated_A_real, torch.ones(b, 1, h, w).cuda())
+
+                loss_B = mse(discriminated_B_fake, torch.zeros(b, 1, h, w).cuda())
+                loss_B += mse(discriminator_B_real, torch.ones(b, 1, h, w).cuda())
+
+                loss = (loss_A + loss_B) / 2.0
+
+            elif wasserstein:
+                
+                # critic loss
+
+                loss_A = torch.mean(discriminated_A_fake)
+                loss_A -= torch.mean(discriminated_A_real)
+
+                loss_B = torch.mean(discriminated_B_fake)
+                loss_B -= torch.mean(discriminator_B_real)
+
+
+                # gradient penalty
+                alpha = torch.rand(b, 1, 1, 1).cuda()
+                interpolated_A = (alpha * A + (1 - alpha) * generated_A_fake).requires_grad_(True)
+                interpolated_B = (alpha * B + (1 - alpha) * generated_B_fake).requires_grad_(True)
+
+                disc_A = discriminator_A(interpolated_A)
+                disc_B = discriminator_B(interpolated_B)
+
+                grad_A = torch.autograd.grad(
+                    outputs=disc_A,
+                    inputs=interpolated_A,
+                    grad_outputs=torch.ones_like(disc_A),
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
+
+                grad_B = torch.autograd.grad(
+                    outputs=disc_B,
+                    inputs=interpolated_B,
+                    grad_outputs=torch.ones_like(disc_B),
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
+
+                grad_penalty_A = (grad_A.norm(2, dim=1) - 1) ** 2
+                grad_penalty_B = (grad_B.norm(2, dim=1) - 1) ** 2
+
+                loss_A += grad_penalty_A.mean() * 10
+                loss_B += grad_penalty_B.mean() * 10
+
+                loss = (loss_A + loss_B) / 2.0
 
             disc_loss.append(loss.item())
 
         disc_opt.zero_grad()
         disc_scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(disc_opt.parameters(), 0.5)
         disc_scaler.step(disc_opt)
         disc_scaler.update()
 
@@ -114,22 +170,23 @@ def train_one_epoch(
             loss_A = mse(discriminated_A_fake, torch.ones(b, 1, h, w).cuda())
             loss_B = mse(discriminated_B_fake, torch.ones(b, 1, h, w).cuda())
 
-            cycle_A = generator_A_to_B(generated_A_fake)
-            cycle_B = generator_B_to_A(generated_B_fake)
+            cycle_B = generator_A_to_B(generated_A_fake)
+            cycle_A = generator_B_to_A(generated_B_fake)
 
             loss = (
                 loss_A
                 + loss_B
-                + loss_l1(cycle_B, A) * 10.0
-                + loss_l1(cycle_A, B) * 10.0
-                + loss_l1(generator_B_to_A(A), A)
-                + loss_l1(generator_A_to_B(B), B)
-            ) / 6.0
+                + loss_l1(cycle_B, B) * lambda_A
+                + loss_l1(cycle_A, A) * lambda_B
+                + loss_l1(generator_B_to_A(A), A) * lambda_idt_B
+                + loss_l1(generator_A_to_B(B), B) * lambda_idt_B
+            )
 
             gen_loss.append(loss.item())
 
         gen_opt.zero_grad()
         gen_scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(gen_opt.parameters(), 0.5)
         gen_scaler.step(gen_opt)
         gen_scaler.update()
 
@@ -168,26 +225,26 @@ for epoch in range(n_epochs):
     generator_B_to_A.eval()
 
     k = 0
-    for x, y in tqdm(test_loader):
+    for A, B in tqdm(test_loader):
 
-        x, y = x.cuda(), y.cuda()
+        A, B = A.cuda(), B.cuda()
 
         with torch.cuda.amp.autocast():
-            x_ = generator_A_to_B(x)
-            y_ = generator_B_to_A(y)
+            B_fake = generator_A_to_B(A)
+            A_fake = generator_B_to_A(B)
 
-        x_ = test_dataset.denormalize(x_)
-        y_ = test_dataset.denormalize(y_)
+        A_fake = test_dataset.denormalize(A_fake)
+        B_fake = test_dataset.denormalize(B_fake)
 
-        x_ = torch.clamp(x_, 0, 1)
-        y_ = torch.clamp(y_, 0, 1)
+        A_fake = torch.clamp(A_fake, 0, 1)
+        B_fake = torch.clamp(B_fake, 0, 1)
 
-        save_image(x_, f"imgs/zebra_{k}.png")
-        save_image(y_, f"imgs/horse_{k}.png")
+        save_image(A_fake, f"imgs/zebra_{k}.png")
+        save_image(B_fake, f"imgs/horse_{k}.png")
 
         k += 1
 
-    del x
-    del y
-    del x_
-    del y_
+    del A
+    del B
+    del A_fake
+    del B_fake

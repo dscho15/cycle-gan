@@ -54,26 +54,24 @@ class Generator(torch.nn.Module):
         super(Generator, self).__init__()
 
         self.down_blocks = torch.nn.Sequential(
-            ConvBlock(3, base_channels, 7, 1, 3, act=True),
+            ConvBlock(3, base_channels, 7, 1, 3),
             ConvBlock(
                 base_channels,
                 base_channels * 2,
                 kernel_size=3,
                 stride=2,
-                padding=1,
-                act=True,
+                padding=1
             ),
             ConvBlock(
                 base_channels * 2,
                 base_channels * 4,
                 kernel_size=3,
                 stride=2,
-                padding=1,
-                act=True,
+                padding=1
             ),
         )
 
-        self.residual_blocks = torch.nn.Sequential(
+        self.middle_blocks = torch.nn.Sequential(
             *[ResidualBlock(base_channels * 4) for _ in range(n_residual_blocks)]
         )
 
@@ -111,14 +109,14 @@ class Generator(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.down_blocks(x)
-        x = self.residual_blocks(x)
+        x = self.middle_blocks(x)
         x = self.up_blocks(x)
         return torch.tanh(x)
 
 
 class Discriminator(torch.nn.Module):
 
-    def __init__(self, base_channels: int = 64):
+    def __init__(self, base_channels: int = 64, wasserstein: bool = False):
         super(Discriminator, self).__init__()
 
         # convert into a sequential
@@ -160,6 +158,8 @@ class Discriminator(torch.nn.Module):
             ),
         )
 
+        self.wasserstein = wasserstein
+
     def forward(self, x: torch.Tensor):
         x = self.model(x)
-        return torch.sigmoid(x)
+        return torch.sigmoid(x) if not self.wasserstein else x
